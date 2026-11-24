@@ -1,0 +1,4 @@
+# Build output: FanControl.exe is compiled from FanControl.cs with csc (see README)
+*.exe
+*.pdb
+*.obj
