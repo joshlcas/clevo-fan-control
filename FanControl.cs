@@ -29,6 +29,41 @@ namespace ClevoFan
         [DllImport("user32")]
         public static extern bool SetProcessDPIAware();
 
+        // Not DPI-aware means these are already in device pixels, which is what
+        // WinForms wants, so a screen that fits at 100 % still fits at 150 %.
+        [DllImport("user32")]
+        public static extern int GetSystemMetrics(int index);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct Rect
+        {
+            public int Left, Top, Right, Bottom;
+        }
+
+        [DllImport("user32")]
+        public static extern bool SystemParametersInfo(uint action, uint param, out Rect rect, uint flags);
+
+        // Power plans. Plain user rights: activating a scheme only affects the
+        // logged-on user, which is exactly the scope needed here.
+        [DllImport("powrprof.dll")]
+        public static extern uint PowerGetActiveScheme(IntPtr userRoot, out IntPtr schemeGuid);
+
+        [DllImport("powrprof.dll")]
+        public static extern uint PowerSetActiveScheme(IntPtr userRoot, ref Guid schemeGuid);
+
+        [DllImport("powrprof.dll")]
+        public static extern uint PowerWriteACValueIndex(IntPtr userRoot, ref Guid scheme, ref Guid sub,
+            ref Guid setting, uint value);
+
+        [DllImport("powrprof.dll")]
+        public static extern uint PowerWriteDCValueIndex(IntPtr userRoot, ref Guid scheme, ref Guid sub,
+            ref Guid setting, uint value);
+
+        // The scheme is created once by tools\New-PowerPlan.ps1 (admin only);
+        // the exe only ever activates what is already there.
+        [DllImport("kernel32", SetLastError = true)]
+        public static extern IntPtr LocalFree(IntPtr h);
+
         [StructLayout(LayoutKind.Sequential)]
         public struct FileTime
         {
@@ -278,6 +313,16 @@ namespace ClevoFan
             return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
         }
 
+        // Locked mode: the curve used while the session is locked. Deliberately
+        // separate from Custom and written for this machine's job - an idle
+        // desktop serving background agents, not a game - so the fans idle at
+        // 0 % through the 40s and 50s and only start moving in the low 50s.
+        public static FanCurve Locked()
+        {
+            return new FanCurve(new int[] { 55, 55, 55 }, new int[] { 14, 14, 14 },
+                                new int[] { 72, 72, 72 }, new int[] { 60, 60, 60 }, 0);
+        }
+
         public string Describe(FanTable t)
         {
             StringBuilder sb = new StringBuilder();
@@ -413,6 +458,149 @@ namespace ClevoFan
         }
     }
 
+    // Power side of locked mode. The scheme is created once by build.cmd
+    // (PowerDuplicateScheme needs admin); this code only writes its values and
+    // activates it, which a normal user may do. Everything is best-effort:
+    // a missing scheme or a failed write just means locked mode is fans-only.
+    //
+    // No package (PL1/PL2) limit here on purpose: those settings are not in
+    // this machine's processor subgroup at all, so a "watts" box would report
+    // success and cap nothing. The clock caps below are what actually applies.
+    static class LockedPower
+    {
+        // Found by exact name at startup: creating a scheme is admin-only and
+        // powercfg will not give it a chosen GUID, so the tool creates it with
+        // tools\New-PowerPlan.ps1 and the app looks it up here.
+        public const string SchemeName = "ClevoFanControl - locked";
+        public static readonly Guid SubProcessor = new Guid("54533251-82be-4824-96c1-47b60b740d00");
+        public static readonly Guid MaxState = new Guid("bc5038f7-23e0-4960-96da-33abaf5935ec");
+        public static readonly Guid MinState = new Guid("893dee8e-2bef-41e0-89c6-b55d0929964c");
+        public static readonly Guid BoostMode = new Guid("be337238-0d82-4146-a960-4f3749d470c7");
+        public static readonly Guid Epp = new Guid("36687f9e-e3a5-4dbf-b1dc-15eb381c6863");
+        public static readonly Guid MaxCores = new Guid("0cc5b647-c1df-4637-891a-dec35c318583");
+
+        static Guid? scheme;
+        static bool looked;
+
+        public static Guid? Scheme
+        {
+            get
+            {
+                if (!looked)
+                {
+                    looked = true;
+                    scheme = FindByName(SchemeName);
+                }
+                return scheme;
+            }
+        }
+
+        // powercfg /L output: "Power Scheme GUID: xxxxxxxx-...  (Name)".
+        static Guid? FindByName(string name)
+        {
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo("powercfg", "/L");
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.CreateNoWindow = true;
+                psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+                using (System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi))
+                {
+                    string text = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit(3000);
+                    foreach (string line in text.Split('\n'))
+                    {
+                        if (line.IndexOf("(" + name + ")", StringComparison.Ordinal) < 0) continue;
+                        System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(
+                            line, "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+                        Guid g;
+                        if (m.Success && Guid.TryParse(m.Value, out g)) return g;
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // True when the hidden plan exists *and* is the one Windows is using,
+        // which is the only reliable "the CPU is actually capped" signal.
+        public static bool InEffect()
+        {
+            Guid? active = Active();
+            return active.HasValue && Scheme.HasValue && active.Value == Scheme.Value;
+        }
+
+        public static Guid? Active()
+        {
+            IntPtr p;
+            if (Native.PowerGetActiveScheme(IntPtr.Zero, out p) != 0 || p == IntPtr.Zero) return null;
+            try { return (Guid)Marshal.PtrToStructure(p, typeof(Guid)); }
+            finally { Native.LocalFree(p); }
+        }
+
+        public static bool Activate(Guid g)
+        {
+            return Native.PowerSetActiveScheme(IntPtr.Zero, ref g) == 0;
+        }
+
+        // Every write takes local copies: C# will not pass a static readonly
+        // field by ref, and the copies stop a caller from rewriting the GUIDs.
+        static uint WriteAc(Guid setting, uint value)
+        {
+            Guid s;
+            if (!Scheme.HasValue) return 1;
+            s = Scheme.Value;
+            Guid sub = SubProcessor, set = setting;
+            return Native.PowerWriteACValueIndex(IntPtr.Zero, ref s, ref sub, ref set, value);
+        }
+
+        static uint WriteDc(Guid setting, uint value)
+        {
+            Guid s;
+            if (!Scheme.HasValue) return 1;
+            s = Scheme.Value;
+            Guid sub = SubProcessor, set = setting;
+            return Native.PowerWriteDCValueIndex(IntPtr.Zero, ref s, ref sub, ref set, value);
+        }
+
+        static void WriteBoth(Guid setting, uint value)
+        {
+            WriteAc(setting, value);
+            WriteDc(setting, value);
+        }
+
+        // Writes the numbers from Settings into the hidden scheme. Returns the
+        // scheme GUID that was active before, so the caller can go back to it.
+        public static Guid? Configure(Settings s)
+        {
+            Guid? previous = Active();
+            if (!Scheme.HasValue) return previous;   // fans-only; the caller reports it
+
+            WriteBoth(MaxState, (uint)s.LockedMaxState);
+            WriteBoth(MinState, (uint)s.LockedMinState);
+            WriteBoth(BoostMode, s.LockedBoostOff ? 0u : 2u);   // 0 disabled, 2 aggressive = firmware default
+            WriteBoth(Epp, (uint)s.LockedEpp);
+            WriteBoth(MaxCores, (uint)s.LockedMaxCores);
+            return previous;
+        }
+
+        // True when the scheme exists and accepts writes.
+        public static bool Ready(Settings s)
+        {
+            return WriteAc(MaxState, (uint)s.LockedMaxState) == 0;
+        }
+
+        // Called on unlock: back to the plan that was active at lock time.
+        public static void Restore(string previousGuid)
+        {
+            Guid g;
+            if (string.IsNullOrEmpty(previousGuid) || !Guid.TryParse(previousGuid, out g)) return;
+            if (Scheme.HasValue && g == Scheme.Value) return;
+            Activate(g);
+        }
+    }
+
     // System-wide CPU busy using GetSystemTimes. Deltas between ticks, smoothed
     // with a short EMA so a single noisy tick does not move the fans.
     sealed class SystemLoad
@@ -447,7 +635,7 @@ namespace ClevoFan
         }
     }
 
-    enum FanMode { Auto, Manual, Custom, Quiet, Smart }
+    enum FanMode { Auto, Manual, Custom, Quiet, Smart, Locked }
 
     sealed class Settings
     {
@@ -467,24 +655,74 @@ namespace ClevoFan
         public int[] T3 = new int[] { 86, 86, 86 };
         public int[] D3 = new int[] { 55, 55, 55 };
 
+        // Locked mode's power side. The fan side is FanCurve.Locked(). These are
+        // written into the hidden "ClevoFanControl - locked" scheme; AC and DC
+        // are kept identical because the machine can be either when it locks.
+        public bool LockedPowerEnabled = true;
+        public int LockedMaxState = 25;     // % of max clock - 50 % on this i9 is
+                                            // still 1.8 GHz, i.e. above base clock
+        public int LockedMinState = 5;
+        public bool LockedBoostOff = true;  // PERFBOOSTMODE 0
+        public int LockedEpp = 90;          // PERFEPP, 0 = full speed, 100 = max saving
+        public int LockedMaxCores = 60;     // CPMAXCORES, % of cores left unparked
+
+        public Settings Clone()
+        {
+            Settings s = new Settings();
+            s.AutoStart = AutoStart;
+            s.Mode = Mode;
+            s.Guard = Guard;
+            s.GuardTemp = GuardTemp;
+            s.Restore = Restore;
+            s.Reapply = Reapply;
+            s.Link = Link;
+            s.MinDuty = MinDuty;
+            Array.Copy(T2, s.T2, 3);
+            Array.Copy(D2, s.D2, 3);
+            Array.Copy(T3, s.T3, 3);
+            Array.Copy(D3, s.D3, 3);
+            s.LockedPowerEnabled = LockedPowerEnabled;
+            s.LockedMaxState = LockedMaxState;
+            s.LockedMinState = LockedMinState;
+            s.LockedBoostOff = LockedBoostOff;
+            s.LockedEpp = LockedEpp;
+            s.LockedMaxCores = LockedMaxCores;
+            return s;
+        }
+
         public FanCurve Custom()
         {
             return new FanCurve(T2, D2, T3, D3, MinDuty);
         }
 
-        // Same shape as Custom, shifted 3 C later and trimmed 2 / 4 points, so
-        // it stays just under Custom wherever the user moves the curve.
+        // Quiet = Custom evaluated 3 C earlier, i.e. the same shape moved so it
+        // answers a little sooner, then trimmed a couple of points.
+        //
+        // The previous version shifted the anchor points instead, which broke
+        // the ramp: it kept Custom's T2->T3 slope only if T3 happened to move
+        // with T2, and the trim was taken out of the top too. The result was a
+        // curve that crawled (64 % at the guard) and then jumped straight to
+        // 100 % when the guard fired at 92 C. Shifting the temperature and
+        // trimming the output keeps the whole ramp smooth and, by construction,
+        // never louder than Custom at the same temperature.
         public FanCurve QuietCurve()
         {
+            // D2/T2/T3 are sampled from Custom 3 C to the left, so encode the
+            // shifted curve as anchor points that reproduce exactly that when
+            // interpolated: same temperatures, Custom's values from T-3.
+            FanCurve c = Custom();
             int[] t2 = new int[3], d2 = new int[3], t3 = new int[3], d3 = new int[3];
             for (int i = 0; i < 3; i++)
             {
-                t2[i] = T2[i] + 3;
-                d2[i] = D2[i] - 2;
-                t3[i] = T3[i] + 3;
-                d3[i] = D3[i] - 4;
+                // Keep the temperatures; take the duty Custom would give 3 C earlier.
+                t2[i] = c.T2[i];
+                t3[i] = c.T3[i];
+                double atT2 = c.Eval(i, c.T2[i] - 3, 40);
+                double atT3 = c.Eval(i, c.T3[i] - 3, 40);
+                d2[i] = (int)Math.Round(atT2) - 2;
+                d3[i] = (int)Math.Round(atT3) - 4;
             }
-            return new FanCurve(t2, d2, t3, d3, MinDuty);
+            return new FanCurve(t2, d2, t3, d3, Math.Max(0, MinDuty - 2));
         }
 
         static string Dir
@@ -527,6 +765,12 @@ namespace ClevoFan
             s.Reapply = Bool(m, "reapply", true);
             s.Link = Bool(m, "link", true);
             s.MinDuty = Int(m, "minDuty", 15);
+            s.LockedPowerEnabled = Bool(m, "lockedPower", true);
+            s.LockedMaxState = Int(m, "lockedMaxState", 25);
+            s.LockedMinState = Int(m, "lockedMinState", 5);
+            s.LockedBoostOff = Bool(m, "lockedBoostOff", true);
+            s.LockedEpp = Int(m, "lockedEpp", 90);
+            s.LockedMaxCores = Int(m, "lockedMaxCores", 60);
 
             string modeText = Get(m, "mode");
             FanMode parsed;
@@ -548,10 +792,17 @@ namespace ClevoFan
             Array.Copy(c.D3, s.D3, 3);
             s.MinDuty = c.MinDuty;
 
+            // A saved "locked" is stale: that mode only ever applies while the
+            // session is actually locked, and never between runs.
+            if (s.Mode == FanMode.Locked) s.Mode = FanMode.Auto;
+
             s.GuardTemp = Fans.Clamp(s.GuardTemp, 55, 105);
+            s.LockedMaxState = Fans.Clamp(s.LockedMaxState, 5, 100);
+            s.LockedMinState = Fans.Clamp(s.LockedMinState, 1, 100);
+            s.LockedEpp = Fans.Clamp(s.LockedEpp, 0, 100);
+            s.LockedMaxCores = Fans.Clamp(s.LockedMaxCores, 10, 100);
             return s;
         }
-
         public void Save()
         {
             try
@@ -567,6 +818,12 @@ namespace ClevoFan
                 sb.AppendLine("reapply=" + (Reapply ? 1 : 0));
                 sb.AppendLine("link=" + (Link ? 1 : 0));
                 sb.AppendLine("minDuty=" + MinDuty.ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine("lockedPower=" + (LockedPowerEnabled ? 1 : 0));
+                sb.AppendLine("lockedMaxState=" + LockedMaxState.ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine("lockedMinState=" + LockedMinState.ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine("lockedBoostOff=" + (LockedBoostOff ? 1 : 0));
+                sb.AppendLine("lockedEpp=" + LockedEpp.ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine("lockedMaxCores=" + LockedMaxCores.ToString(CultureInfo.InvariantCulture));
                 for (int i = 0; i < 3; i++)
                 {
                     string k = i.ToString(CultureInfo.InvariantCulture);
@@ -577,6 +834,42 @@ namespace ClevoFan
                 }
                 File.WriteAllText(FilePath, sb.ToString());
             }
+            catch { }
+        }
+
+        static string StatePath
+        {
+            get { return Path.Combine(Dir, "locked-backup.ini"); }
+        }
+
+        // Written before the locked scheme is activated and deleted after the
+        // original scheme is restored. An interrupted lock (crash, Task Manager
+        // kill) leaves this behind, so the next start puts the user's power
+        // settings back instead of leaving the machine throttled.
+        public static void SaveThrottleBackup(string schemeGuid)
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                File.WriteAllText(StatePath, schemeGuid + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        public static string LoadThrottleBackup()
+        {
+            try
+            {
+                if (!File.Exists(StatePath)) return null;
+                string g = File.ReadAllText(StatePath).Trim();
+                return g.Length == 0 ? null : g;
+            }
+            catch { return null; }
+        }
+
+        public static void ClearThrottleBackup()
+        {
+            try { if (File.Exists(StatePath)) File.Delete(StatePath); }
             catch { }
         }
 
@@ -1149,8 +1442,15 @@ namespace ClevoFan
         Label lblCpu, lblGpu, lblInfo, lblCpuPct, lblGpuPct, lblMode, lblSmart, lblStatus;
         TrackBar tbCpu, tbGpu;
         NumericUpDown numCpu, numGpu, numGuard;
-        CheckBox chkLink, chkGuard, chkRestore, chkReapply, chkAutoStart;
-        Button btnApply, btnMax, btnOff, btnManual, btnCustom, btnQuiet, btnSmart, btnAuto, btnEdit;
+        CheckBox chkLink, chkGuard, chkRestore, chkReapply, chkAutoStart, chkLocked;
+        Button btnApply, btnMax, btnOff, btnManual, btnCustom, btnQuiet, btnSmart, btnAuto, btnEdit, btnLockedSetup;
+        Label lblLockedSummary;
+        // The always-visible banner: inside the scrolling page, plus a copy that
+        // stays pinned below it so the state is visible without scrolling.
+        Panel bannerContent, bannerPinned;
+        Label bannerContentTitle, bannerContentDetail;
+        Label bannerPinnedTitle, bannerPinnedDetail;
+        Panel scroll;
         NotifyIcon tray;
 
         bool syncing;
@@ -1172,6 +1472,14 @@ namespace ClevoFan
         int histPos, histCount;
         bool signalInstalled;
 
+        // Locked mode. prevMode is what to go back to on unlock; sessionLocked
+        // is read from the timer rather than from SessionSwitch alone so a
+        // standby that started in a previous session is never resumed.
+        FanMode prevMode = FanMode.Auto;
+        bool locked;
+        bool sessionLocked;
+        string throttleBackup;
+
         public MainForm(Settings s, bool startHidden, EventWaitHandle showSignal)
         {
             this.settings = s;
@@ -1179,14 +1487,15 @@ namespace ClevoFan
             this.showSignal = showSignal;
 
             Text = "Clevo Fan Control";
-            ClientSize = new Size(640, 716);
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
-            FormBorderStyle = FormBorderStyle.FixedSingle;
-            MaximizeBox = false;
+            MinimumSize = new Size(580, 360);   // narrow enough for a 720p-class panel
             Font = new Font("Segoe UI", 9f);
             Icon = Logo.ToIcon(32);
 
             BuildUi();
+            FitToScreen();
             ApplySettingsToUi();
 
             poll.Interval = 1000;
@@ -1200,10 +1509,42 @@ namespace ClevoFan
             // never raised. Start the controller from the constructor instead.
             SetupTray();
             Poll();                                   // seed lastT
+            RecoverInterruptedLock();
+            SystemEvents.SessionSwitch += OnSessionSwitch;
             EnterMode(settings.Mode, true);
             settings.Save();                          // make the file exist on first run
             poll.Start();
             reapply.Start();
+        }
+
+        // A previous run was killed between activating the locked scheme and
+        // restoring it. The fans are not ours to guess at (the EC re-asserts
+        // its own curve after that), but a throttled CPU must not survive.
+        void RecoverInterruptedLock()
+        {
+            string backup = Settings.LoadThrottleBackup();
+            if (backup == null) return;
+
+            LockedPower.Restore(backup);          // power first: no fans are owed here
+            Settings.ClearThrottleBackup();
+            lblStatus.Text = "restored the power plan after an interrupted locked mode";
+        }
+
+        void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
+        {
+            try
+            {
+                sessionLocked = (e.Reason == SessionSwitchReason.SessionLock);
+                if (e.Reason == SessionSwitchReason.SessionUnlock && locked)
+                {
+                    // SessionSwitch is delivered on the UI thread's message
+                    // loop, so act now instead of posting: an unlock must never
+                    // depend on a later BeginInvoke being pumped into a thread
+                    // that is about to be busy or blocked.
+                    ExitLockedMode();
+                }
+            }
+            catch { }
         }
 
         protected override void OnShown(EventArgs e)
@@ -1236,6 +1577,33 @@ namespace ClevoFan
 
         // ---------------------------------------------------------------- UI
 
+        // Every control below the header lives on this panel, which scrolls, so
+        // nothing is ever unreachable on a small screen. Groups are positioned
+        // relative to it; the vertical scrollbar lives on the far edge.
+        Panel MakePage()
+        {
+            Panel p = new Panel();
+            p.Name = "page";
+            p.AutoScroll = true;
+            p.Dock = DockStyle.None;   // positioned by LayoutForWindow, below the header
+            p.BackColor = SystemColors.Control;
+            Controls.Add(p);
+            return p;
+        }
+
+        // Group boxes keep their absolute X so the page never scrolls sideways:
+        // the vertical scrollbar is only visible once it appears, so a control
+        // at X = 647 could otherwise be wider than the panel's client area.
+        GroupBox MakeGroupOn(Control parent, string text, int y, int h)
+        {
+            GroupBox g = new GroupBox();
+            g.Text = text;
+            g.Location = new Point(12, y);
+            g.Size = new Size(606, h);
+            parent.Controls.Add(g);
+            return g;
+        }
+
         void BuildUi()
         {
             PictureBox mark = new PictureBox();
@@ -1259,7 +1627,11 @@ namespace ClevoFan
             sub.Location = new Point(56, 42);
             Controls.Add(sub);
 
-            GroupBox gStatus = MakeGroup("Live", 66, 98);
+            scroll = MakePage();
+            scroll.SendToBack();   // header stays above it in z-order
+            BuildBanners(scroll);
+
+            GroupBox gStatus = MakeGroupOn(scroll, "Live", 100, 98);
             lblCpu = MakeMono(gStatus, 14, 20);
             lblGpu = MakeMono(gStatus, 14, 44);
             lblInfo = new Label();
@@ -1268,7 +1640,7 @@ namespace ClevoFan
             lblInfo.Location = new Point(14, 70);
             gStatus.Controls.Add(lblInfo);
 
-            GroupBox gMode = MakeGroup("Fan mode", 170, 132);
+            GroupBox gMode = MakeGroupOn(scroll, "Fan mode", 204, 132);
             btnManual = MakeButton(gMode, "Manual", 16, 24, 84);
             btnCustom = MakeButton(gMode, "Custom", 104, 24, 84);
             btnQuiet = MakeButton(gMode, "Quiet", 192, 24, 84);
@@ -1303,7 +1675,7 @@ namespace ClevoFan
             modeHint.Text = "Custom, Quiet and Smart drive the duty directly, so they reach below the EC curve floor.";
             gMode.Controls.Add(modeHint);
 
-            GroupBox gManual = MakeGroup("Manual duty", 308, 172);
+            GroupBox gManual = MakeGroupOn(scroll, "Manual duty", 342, 172);
             AddLabel(gManual, "CPU", 16, 26);
             tbCpu = MakeSlider(gManual, 60, 16);
             numCpu = MakeNum(gManual, 402, 24);
@@ -1362,7 +1734,7 @@ namespace ClevoFan
             manualHint.Location = new Point(300, 144);
             gManual.Controls.Add(manualHint);
 
-            GroupBox gSafety = MakeGroup("Safety", 486, 104);
+            GroupBox gSafety = MakeGroupOn(scroll, "Safety", 520, 104);
             chkGuard = new CheckBox();
             chkGuard.Text = "Temperature guard: full speed above";
             chkGuard.AutoSize = true;
@@ -1390,7 +1762,38 @@ namespace ClevoFan
             chkReapply.Location = new Point(16, 78);
             gSafety.Controls.Add(chkReapply);
 
-            GroupBox gStartup = MakeGroup("Startup and tray", 596, 112);
+            GroupBox gLocked = MakeGroupOn(scroll, "Locked mode", 632, 112);
+            chkLocked = new CheckBox();
+            chkLocked.Text = "On lock: cap the power and let the fans idle";
+            chkLocked.AutoSize = true;
+            chkLocked.Location = new Point(16, 22);
+            chkLocked.CheckedChanged += delegate
+            {
+                settings.LockedPowerEnabled = chkLocked.Checked;
+                settings.Save();
+                UpdateBanner();
+                if (locked && !chkLocked.Checked) ExitLockedMode();
+            };
+            gLocked.Controls.Add(chkLocked);
+
+            btnLockedSetup = MakeButton(gLocked, "Locked mode setup...", 300, 18, 150);
+            btnLockedSetup.Click += delegate { ShowLockedSetup(); };
+            gLocked.Controls.Add(btnLockedSetup);
+
+            lblLockedSummary = new Label();
+            lblLockedSummary.AutoSize = true;
+            lblLockedSummary.ForeColor = Color.DimGray;
+            lblLockedSummary.Location = new Point(16, 50);
+            gLocked.Controls.Add(lblLockedSummary);
+
+            Label lockedHint = new Label();
+            lockedHint.Text = "Unlocked at all other times. Edit the fan curve this mode enforces in the setup window.";
+            lockedHint.ForeColor = Color.DimGray;
+            lockedHint.AutoSize = true;
+            lockedHint.Location = new Point(16, 72);
+            gLocked.Controls.Add(lockedHint);
+
+            GroupBox gStartup = MakeGroupOn(scroll, "Startup and tray", 752, 112);
             chkAutoStart = new CheckBox();
             chkAutoStart.Text = "Start with Windows, hidden in the notification area";
             chkAutoStart.AutoSize = true;
@@ -1418,14 +1821,195 @@ namespace ClevoFan
             gStartup.Controls.Add(lblStatus);
         }
 
-        GroupBox MakeGroup(string text, int y, int h)
+        // The locked-mode banner. Shown inside the page (so it is the first
+        // thing in it even after scrolling) and again pinned under the page, so
+        // the state is never hidden by scrolling whatever the window size.
+        void BuildBanners(Control page)
         {
-            GroupBox g = new GroupBox();
-            g.Text = text;
-            g.Location = new Point(12, y);
-            g.Size = new Size(616, h);
-            Controls.Add(g);
-            return g;
+            bannerContent = MakeBanner(page, 34, false);
+            bannerPinned = MakeBanner(this, 34, true);
+            bannerContentTitle = BannerTitle(bannerContent);
+            bannerContentDetail = BannerDetail(bannerContent);
+            bannerPinnedTitle = BannerTitle(bannerPinned);
+            bannerPinnedDetail = BannerDetail(bannerPinned);
+        }
+
+        Panel MakeBanner(Control parent, int y, bool docked)
+        {
+            Panel p = new Panel();
+            p.Location = new Point(12, y);
+            p.Size = new Size(606, 54);
+            p.BackColor = SystemColors.Control;
+            p.Visible = false;
+            p.Cursor = Cursors.Hand;
+            p.Click += delegate
+            {
+                scroll.ScrollControlIntoView(bannerContent);
+                if (chkLocked != null) chkLocked.Focus();
+            };
+            parent.Controls.Add(p);
+            return p;
+        }
+
+        static Label BannerTitle(Panel p)
+        {
+            Label l = new Label();
+            l.Font = new Font("Segoe UI Semibold", 11f);
+            l.AutoSize = true;
+            l.Location = new Point(12, 6);
+            l.Click += delegate { if (p.Parent != null) p.Parent.Focus(); };
+            p.Controls.Add(l);
+            return l;
+        }
+
+        // Wraps rather than running off the right edge; the panel is resized
+        // around this label so the whole sentence is always readable.
+        static Label BannerDetail(Panel p)
+        {
+            Label l = new Label();
+            l.AutoSize = false;
+            l.Location = new Point(12, 30);
+            p.Controls.Add(l);
+            return l;
+        }
+
+        // Called whenever the state changes, and from the poll tick.
+        //   - locked mode running  -> loud red banner
+        //   - enabled but not locked, no plan -> amber, it will only quiet fans
+        //   - enabled -> quiet green, it is armed
+        void UpdateBanner()
+        {
+            bool armed = settings.LockedPowerEnabled;
+            string title, detail;
+            Color back, fore;
+
+            if (locked)
+            {
+                bool capped = LockedPower.InEffect();
+                back = Color.FromArgb(176, 0, 32);          // loud red
+                fore = Color.White;
+                title = "\u25CF LOCKED MODE RUNNING - fans idling";
+                if (!armed)
+                    detail = "Locked by the session; locked mode is disabled in settings.";
+                else if (capped)
+                    detail = string.Format("CPU capped to {0} %, no boost, EPP {1} %, {2} % cores idle.",
+                        settings.LockedMaxState, settings.LockedEpp, 100 - settings.LockedMaxCores);
+                else
+                    detail = "FANS are idling but the CPU is NOT capped: the power plan is missing " +
+                             "or could not be switched to. Run tools\\New-PowerPlan.ps1 (admin).";
+            }
+            else if (!armed)
+            {
+                back = SystemColors.ControlLight;
+                fore = SystemColors.ControlDarkDark;
+                title = "\u25CB Locked mode is off";
+                detail = "Tick \"On lock\" below to cap the power and idle the fans when the session locks.";
+            }
+            else if (!LockedPower.Scheme.HasValue)
+            {
+                back = Color.FromArgb(255, 224, 130);       // amber
+                fore = Color.FromArgb(64, 44, 0);
+                title = "\u26A0 Locked mode is armed - but will only idle the fans";
+                detail = "The power plan is missing. Run tools\\New-PowerPlan.ps1 (admin) once to cap the CPU too.";
+            }
+            else
+            {
+                back = Color.FromArgb(198, 239, 206);       // green
+                fore = Color.FromArgb(6, 64, 24);
+                title = "\u2713 Locked mode is armed";
+                detail = "On lock: CPU capped to " + settings.LockedMaxState + " %, no boost, fans idle until warm.";
+            }
+
+            ApplyBanner(bannerContent, true, title, detail, back, fore);
+            ApplyBanner(bannerPinned, false, title, detail, back, fore);
+
+            // The pinned copy is only needed when the page can scroll.
+            bannerPinned.Visible = locked || (scroll != null && scroll.VerticalScroll.Visible);
+        }
+
+        void ApplyBanner(Panel p, bool contentBanner, string title, string detail, Color back, Color fore)
+        {
+            p.BackColor = back;
+            Label t = contentBanner ? bannerContentTitle : bannerPinnedTitle;
+            Label d = contentBanner ? bannerContentDetail : bannerPinnedDetail;
+            t.Text = title;
+            t.ForeColor = fore;
+            d.Text = detail;
+            d.ForeColor = fore;
+
+            int inner = p.Width - 24;
+            if (inner < 200) inner = 200;
+            d.Width = inner;
+            d.Height = TextRenderer.MeasureText(detail, d.Font,
+                new Size(inner, 1000), TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl).Height + 2;
+            t.Width = inner;
+
+            // Grow the bar to fit the wrapped sentence. PinnedHeight uses the
+            // matching constant below, so keep them in step.
+            int needed = d.Top + d.Height + 8;
+            if (p.Height != needed) p.Height = needed;
+            p.Visible = true;
+        }
+
+        // Room the pinned banner needs, measured from the control so a
+        // wrapped sentence is never cut off by the page sitting on top of it.
+        int PinnedHeight
+        {
+            get { return bannerPinned != null && bannerPinned.Visible ? bannerPinned.Height + 6 : 0; }
+        }
+
+        // The page is a fixed design (640 px wide, ~900 tall). On a short
+        // screen it scrolls instead of running off the bottom edge. The page
+        // starts below the header so the banner never crowds the subtitle.
+        void LayoutForWindow()
+        {
+            if (scroll == null) return;
+            const int pageTop = 66;
+            int h = ClientSize.Height - pageTop - PinnedHeight;
+            if (h < 80) h = 80;
+            scroll.Location = new Point(0, pageTop);
+            scroll.Size = new Size(ClientSize.Width, h);
+            scroll.AutoScrollMinSize = new Size(640, PageHeight);
+
+            if (bannerPinned != null)
+            {
+                bannerPinned.Location = new Point(12, scroll.Bottom + 6);
+                bannerPinned.Width = ClientSize.Width - 24;
+            }
+        }
+
+        // Design height: banner (34) + gap + groups down to the last one
+        // (752 + 112) + a little room.
+        const int PageHeight = 900;
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (scroll != null) LayoutForWindow();
+        }
+
+        // Opens tall enough to show the whole page where the screen allows it,
+        // but never taller than the screen's working area - that is what made
+        // the bottom groups unreachable before (a fixed 736 px window).
+        void FitToScreen()
+        {
+            const int workArea = 0x0030;   // SPI_GETWORKAREA
+            Native.Rect r = new Native.Rect();
+            Native.SystemParametersInfo(workArea, 0, out r, 0);
+            int availW = r.Right - r.Left;
+            int availH = r.Bottom - r.Top;
+            if (availW <= 0) availW = Native.GetSystemMetrics(0);
+            if (availH <= 0) availH = Native.GetSystemMetrics(1);
+
+            // header 66 + page design height + pinned banner 60.
+            int wantedH = 66 + PageHeight + 60;
+            int w = Math.Min(640, availW - 40);
+            int h = Math.Min(wantedH, availH - 40);
+            if (w < MinimumSize.Width) w = MinimumSize.Width;
+            if (h < MinimumSize.Height) h = MinimumSize.Height;
+
+            ClientSize = new Size(w, h);
+            LayoutForWindow();
         }
 
         static Label MakeMono(Control parent, int x, int y)
@@ -1499,11 +2083,35 @@ namespace ClevoFan
             chkRestore.Checked = settings.Restore;
             chkReapply.Checked = settings.Reapply;
             chkLink.Checked = settings.Link;
+            chkLocked.Checked = settings.LockedPowerEnabled;
             chkAutoStart.Checked = AutoRun.Enabled();
             settings.AutoStart = chkAutoStart.Checked;
             // Re-write the Run entry so a moved exe does not leave a dead path.
             if (settings.AutoStart) AutoRun.Set(true);
             UpdatePct();
+            UpdateLockedSummary();
+            UpdateBanner();
+        }
+
+        // One line that says what locked mode will actually do, so the numbers
+        // never live only inside the setup dialog.
+        void UpdateLockedSummary()
+        {
+            if (lblLockedSummary == null) return;
+            if (!settings.LockedPowerEnabled)
+            {
+                lblLockedSummary.Text = "disabled - locking changes nothing";
+                return;
+            }
+            string power = string.Format("CPU max {0} %{1}, EPP {2} %, {3} % cores",
+                settings.LockedMaxState,
+                settings.LockedBoostOff ? ", no boost" : "",
+                settings.LockedEpp,
+                settings.LockedMaxCores);
+
+            FanCurve c = FanCurve.Locked();
+            lblLockedSummary.Text = string.Format("fans 0 % below {0} C, {1} % at {2} C, full by {3} C   -   {4}",
+                c.T2[0] - 2, c.D2[0], c.T2[0], c.T3[0], power);
         }
 
         void UpdatePct()
@@ -1529,6 +2137,30 @@ namespace ClevoFan
             menu.Items.Add("Custom", null, delegate { EnterMode(FanMode.Custom, false); });
             menu.Items.Add("Quiet", null, delegate { EnterMode(FanMode.Quiet, false); });
             menu.Items.Add("Smart", null, delegate { EnterMode(FanMode.Smart, false); });
+            menu.Items.Add(new ToolStripSeparator());
+
+            ToolStripMenuItem lockedItem = new ToolStripMenuItem("Quiet standby while locked");
+            lockedItem.Checked = settings.LockedPowerEnabled;
+            lockedItem.Click += delegate
+            {
+                lockedItem.Checked = !lockedItem.Checked;
+                settings.LockedPowerEnabled = lockedItem.Checked;
+                settings.Save();
+                if (chkLocked != null) chkLocked.Checked = lockedItem.Checked;
+                UpdateLockedSummary();
+                UpdateBanner();
+                if (!settings.LockedPowerEnabled && locked) ExitLockedMode();
+            };
+            // Keep the tick in step when it is changed from the window instead.
+            chkLocked.CheckedChanged += delegate
+            {
+                lockedItem.Checked = settings.LockedPowerEnabled;
+                lockedItem.Text = settings.LockedPowerEnabled
+                    ? "Quiet standby while locked  (armed)"
+                    : "Quiet standby while locked";
+            };
+            menu.Items.Add(lockedItem);
+
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, delegate { ExitApp(); });
             tray.ContextMenuStrip = menu;
@@ -1580,6 +2212,8 @@ namespace ClevoFan
 
             poll.Stop();
             reapply.Stop();
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
+            if (locked) ExitLockedMode();
             SaveSettings();
             if (chkRestore.Checked)
             {
@@ -1596,7 +2230,9 @@ namespace ClevoFan
 
         void SaveSettings()
         {
-            settings.Mode = mode;
+            // Locked mode is restored from whatever session it started in, so
+            // never persist it as the user's chosen mode.
+            if (mode != FanMode.Locked) settings.Mode = mode;
             settings.Guard = chkGuard.Checked;
             settings.GuardTemp = (int)numGuard.Value;
             settings.Restore = chkRestore.Checked;
@@ -1637,9 +2273,27 @@ namespace ClevoFan
                 case FanMode.Smart:
                     ApplyCurveMode(settings.Custom(), "smart");
                     break;
+
+                case FanMode.Locked:
+                    ApplyCurveMode(FanCurve.Locked(), "locked");
+                    break;
             }
 
-            if (!restoring)
+            // Unlock: own the fans again *before* the CPU gets its clocks and
+            // boost back, so there is never a moment of full-power with the
+            // fans idle. Reached when the previous mode was Locked - which
+            // only happens if a lock and an unlock raced - or via EnterMode.
+            if (locked && m != FanMode.Locked)
+            {
+                LockedPower.Restore(throttleBackup);
+                Settings.ClearThrottleBackup();
+                throttleBackup = null;
+                locked = false;
+                lblStatus.Text = "unlocked - back to " + m.ToString().ToLowerInvariant()
+                    + " and the previous power plan";
+            }
+
+            if (!restoring && m != FanMode.Locked)
             {
                 settings.Mode = m;
                 settings.Save();
@@ -1688,15 +2342,75 @@ namespace ClevoFan
                 return;
             }
 
-            if (mode == FanMode.Custom || mode == FanMode.Quiet || mode == FanMode.Smart)
+            if (mode == FanMode.Custom || mode == FanMode.Quiet || mode == FanMode.Smart || mode == FanMode.Locked)
             {
                 if (dutyNow[0] < 0) return;
                 Fans.SetDuty(dutyNow[0], dutyNow[1], fanCount > 2 ? dutyNow[2] : 0);
             }
         }
 
+        // ------------------------------------------------------ locked mode
+
+        void EnterLockedMode()
+        {
+            if (locked) return;
+            locked = true;
+            prevMode = mode;
+
+            if (settings.LockedPowerEnabled)
+            {
+                // Record where to go back to before anything is throttled.
+                Guid? previous = LockedPower.Configure(settings);
+                if (previous.HasValue)
+                {
+                    throttleBackup = previous.Value.ToString();
+                    Settings.SaveThrottleBackup(throttleBackup);
+                }
+                if (!LockedPower.Ready(settings) || !LockedPower.Scheme.HasValue)
+                {
+                    lblStatus.Text = "locked: fans idle, but the power plan is missing - "
+                        + "run tools\\New-PowerPlan.ps1 once (admin)";
+                }
+                else if (!LockedPower.Activate(LockedPower.Scheme.Value))
+                {
+                    lblStatus.Text = "locked: fans idle, but the power plan could not be switched to";
+                }
+            }
+
+            EnterMode(FanMode.Locked, true);
+            if (!settings.LockedPowerEnabled)
+                lblStatus.Text = "locked: fans idle, power plan untouched (disabled)";
+            UpdateBanner();
+        }
+
+        void ExitLockedMode()
+        {
+            if (!locked) return;
+            // EnterMode sees `locked` still true and restores the power plan
+            // itself, after the fans are back. Do not clear the flag here.
+            FanMode back = prevMode == FanMode.Locked ? FanMode.Auto : prevMode;
+            EnterMode(back, true);
+            locked = false;
+            UpdateBanner();
+        }
+
+        void CheckLockState()
+        {
+            // SessionSwitch is the trigger; the timer is the safety net if it
+            // was missed (a standby from an earlier session, a replay miss).
+            bool shouldLock = sessionLocked && settings.LockedPowerEnabled;
+            if (shouldLock == locked) return;
+            if (shouldLock) EnterLockedMode();
+            else if (!sessionLocked) ExitLockedMode();
+        }
+
         void Poll()
         {
+            // Before anything that can return early: a lost EC must not also
+            // leave the machine throttled with no way back on unlock.
+            CheckLockState();
+            UpdateBanner();   // also catches the plan being switched away from
+
             Telemetry t = Telemetry.Read();
             load.Sample();
 
@@ -1734,6 +2448,8 @@ namespace ClevoFan
             else if (mode == FanMode.Manual)
                 lblSmart.Text = string.Format("manual duty {0}% / {1}%",
                     Fans.RawToPercent(lastCpu), Fans.RawToPercent(lastGpu));
+            else if (mode == FanMode.Locked)
+                lblSmart.Text = "locked: power capped, fans idle until needed";
 
             hist[histPos, 0] = t.CpuTemp;
             hist[histPos, 1] = t.GpuTemp;
@@ -1762,6 +2478,27 @@ namespace ClevoFan
             UpdateModeUi();
         }
 
+        // The guard is the last line of defence, but switching straight to
+        // 100 % the instant the threshold is touched made every curve jump
+        // from wherever it was (Quiet sat near 65 %) to full speed - which
+        // reads as the fans not scaling nicely, then suddenly roaring.
+        //
+        // Instead, the last GuardBand degrees before the threshold ramp from
+        // the curve's own duty up to full speed: GuardLift returns 0 there and
+        // 1 at the threshold. The hard latch stays for failure safety (if the
+        // fans are not moving at all by the threshold, they are forced on).
+        const int GuardBand = 8;
+
+        double GuardLift(int hottest)
+        {
+            int guard = (int)numGuard.Value;
+            if (!chkGuard.Checked) return 0;
+            int start = guard - GuardBand;
+            if (hottest <= start) return 0;
+            double x = (hottest - start) / (double)GuardBand;
+            return x > 1 ? 1 : x;
+        }
+
         void ApplyGuard(Telemetry t)
         {
             if (mode == FanMode.Auto || !chkGuard.Checked)
@@ -1786,15 +2523,24 @@ namespace ClevoFan
                 dutyNow[0] = dutyNow[1] = dutyNow[2] = -1;   // let the curve take over at once
                 lblStatus.Text = "guard released";
             }
+            else if (!guardActive && hottest >= guard - GuardBand)
+            {
+                // Inside the band but under the threshold: the curve still
+                // runs, ControlTick blends it upward instead of cutting off.
+                lblStatus.Text = "approaching " + guard + " C - ramping up";
+            }
         }
 
         void ControlTick(Telemetry t)
         {
-            if (mode != FanMode.Custom && mode != FanMode.Quiet && mode != FanMode.Smart) return;
+            if (mode != FanMode.Custom && mode != FanMode.Quiet && mode != FanMode.Smart && mode != FanMode.Locked) return;
             if (guardActive) return;
             if (t == null || !t.Ok) return;
 
-            FanCurve c = mode == FanMode.Quiet ? settings.QuietCurve() : settings.Custom();
+            FanCurve c;
+            if (mode == FanMode.Locked) c = FanCurve.Locked();
+            else if (mode == FanMode.Quiet) c = settings.QuietCurve();
+            else c = settings.Custom();
 
             double loadBoost = 0;
             if (mode == FanMode.Smart)
@@ -1807,6 +2553,12 @@ namespace ClevoFan
 
             int[] temps = new int[] { t.CpuTemp, t.GpuTemp, t.Gpu2Temp };
             bool write = false;
+
+            // The guard band uses the hottest sensor, not the channel's own:
+            // the fans are one cooler, so a hot GPU should pull both up.
+            int hottest = t.Hottest();
+            double lift = GuardLift(hottest);
+            int hotWant = (int)Math.Round(Math.Max(0, Math.Min(1, lift)) * 100.0);
 
             for (int ch = 0; ch < 3; ch++)
             {
@@ -1826,6 +2578,8 @@ namespace ClevoFan
 
                 int t1 = t1s[ch];
                 int want = (int)Math.Round(c.Eval(ch, temp + boost, t1));
+                // Approaching the guard, the demand rises smoothly to full speed.
+                if (want < hotWant) want = hotWant;
                 want = Fans.Clamp(Fans.PercentToRaw(want), 0, 255);
 
                 int prev = dutyNow[ch];
@@ -1893,7 +2647,8 @@ namespace ClevoFan
                 bool active = modes[i] == mode;
                 buttons[i].Font = active ? new Font("Segoe UI Semibold", 9f) : new Font("Segoe UI", 9f);
             }
-            lblMode.Text = "mode: " + mode.ToString().ToLowerInvariant();
+            lblMode.Text = "mode: " + mode.ToString().ToLowerInvariant()
+                + (mode == FanMode.Locked ? "   (fans idle, power capped)" : "");
         }
 
         void EditCurve()
@@ -1917,6 +2672,166 @@ namespace ClevoFan
                 }
                 lblStatus.Text = "custom curve saved: minimum " + settings.MinDuty + "%";
             }
+        }
+
+        // A separate window, like Edit curve, so locked mode's settings never
+        // sit among the normal ones. Every control maps 1:1 to a Settings field.
+        void ShowLockedSetup()
+        {
+            using (LockedDialog d = new LockedDialog(settings))
+            {
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+
+                settings.LockedPowerEnabled = d.Enabled;
+                settings.LockedMaxState = d.MaxState;
+                settings.LockedMinState = d.MinState;
+                settings.LockedBoostOff = d.BoostOff;
+                settings.LockedEpp = d.Epp;
+                settings.LockedMaxCores = d.MaxCores;
+                settings.Save();
+
+                chkLocked.Checked = settings.LockedPowerEnabled;
+                UpdateLockedSummary();
+                lblStatus.Text = "locked mode setup saved";
+
+                // Re-entering makes a running lock pick the new numbers up.
+                if (locked)
+                {
+                    FanMode back = prevMode;
+                    ExitLockedMode();
+                    if (settings.LockedPowerEnabled)
+                    {
+                        prevMode = back;
+                        EnterLockedMode();
+                    }
+                }
+            }
+        }
+    }
+
+    // Settings window for locked mode. Deliberately a separate dialog from the
+    // main window's curve editor: these numbers only ever apply while locked.
+    sealed class LockedDialog : Form
+    {
+        readonly Settings s;
+        readonly CheckBox chkPower, chkBoost;
+        readonly NumericUpDown nMax, nMin, nEpp, nCores;
+        readonly Label lblCurve;
+
+        public new bool Enabled { get { return chkPower.Checked; } }
+        public int MaxState { get { return (int)nMax.Value; } }
+        public int MinState { get { return (int)nMin.Value; } }
+        public bool BoostOff { get { return chkBoost.Checked; } }
+        public int Epp { get { return (int)nEpp.Value; } }
+        public int MaxCores { get { return (int)nCores.Value; } }
+
+        public LockedDialog(Settings settings)
+        {
+            s = settings;
+
+            Text = "Clevo Fan Control - locked mode setup";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(470, 352);
+            Font = new Font("Segoe UI", 9f);
+
+            chkPower = new CheckBox();
+            chkPower.Text = "Use this mode while the session is locked";
+            chkPower.AutoSize = true;
+            chkPower.Location = new Point(16, 16);
+            chkPower.Checked = s.LockedPowerEnabled;
+            Controls.Add(chkPower);
+
+            GroupBox gPower = new GroupBox();
+            gPower.Text = "Power cap (the hidden power plan)";
+            gPower.Location = new Point(12, 46);
+            gPower.Size = new Size(446, 200);
+            Controls.Add(gPower);
+
+            nMax = Makespin(gPower, "Maximum processor state", 22, s.LockedMaxState, 5, 100);
+            Label maxHint = new Label();
+            maxHint.Text = "25 % is about 0.9 GHz here. 50 % is still above base clock.";
+            maxHint.ForeColor = Color.DimGray;
+            maxHint.AutoSize = true;
+            maxHint.Location = new Point(16, 70);
+            gPower.Controls.Add(maxHint);
+
+            nMin = Makespin(gPower, "Minimum processor state", 94, s.LockedMinState, 1, 100);
+            nEpp = Makespin(gPower, "Energy preference (EPP)", 126, s.LockedEpp, 0, 100);
+
+            nCores = Makespin(gPower, "Cores left unparked", 154, s.LockedMaxCores, 10, 100);
+            Label coreHint = new Label();
+            coreHint.Text = "Background workers need cores; parking more slows agents more.";
+            coreHint.ForeColor = Color.DimGray;
+            coreHint.AutoSize = true;
+            coreHint.Location = new Point(16, 176);
+            gPower.Controls.Add(coreHint);
+
+            chkBoost = new CheckBox();
+            chkBoost.Text = "No turbo boost while locked (avoids heat spikes)";
+            chkBoost.AutoSize = true;
+            chkBoost.Location = new Point(16, 228);
+            Controls.Add(chkBoost);
+            chkBoost.Checked = s.LockedBoostOff;
+
+            lblCurve = new Label();
+            lblCurve.AutoSize = true;
+            lblCurve.Location = new Point(16, 260);
+            lblCurve.Text = "Fan curve while locked is fixed and gentle:";
+            Controls.Add(lblCurve);
+
+            FanCurve c = FanCurve.Locked();
+            Label curveLine = new Label();
+            curveLine.AutoSize = true;
+            curveLine.ForeColor = Color.DimGray;
+            curveLine.Location = new Point(16, 280);
+            curveLine.Text = string.Format("0 % up to {0} C  ->  {1} % at {2} C  ->  {3} % at {4} C  ->  full at 100 C",
+                c.T2[0], c.D2[0], c.T2[0], c.D3[0], c.T3[0]);
+            Controls.Add(curveLine);
+
+            Label guardLine = new Label();
+            guardLine.AutoSize = true;
+            guardLine.ForeColor = Color.DimGray;
+            guardLine.Location = new Point(16, 298);
+            guardLine.Text = "The Safety temperature guard still overrides this at any temperature.";
+            Controls.Add(guardLine);
+
+            Button ok = new Button();
+            ok.Text = "OK";
+            ok.Location = new Point(262, 320);
+            ok.Size = new Size(88, 26);
+            ok.DialogResult = DialogResult.OK;
+            AcceptButton = ok;
+            Controls.Add(ok);
+
+            Button cancel = new Button();
+            cancel.Text = "Cancel";
+            cancel.Location = new Point(358, 320);
+            cancel.Size = new Size(88, 26);
+            cancel.DialogResult = DialogResult.Cancel;
+            CancelButton = cancel;
+            Controls.Add(cancel);
+        }
+
+        // A labelled spinner, right-aligned label so the numbers line up.
+        static NumericUpDown Makespin(Control parent, string text, int y, int value, int lo, int hi)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.AutoSize = true;
+            l.Location = new Point(16, y + 3);
+            parent.Controls.Add(l);
+
+            NumericUpDown n = new NumericUpDown();
+            n.Minimum = lo;
+            n.Maximum = hi;
+            n.Location = new Point(214, y);
+            n.Size = new Size(58, 23);
+            n.Value = Fans.Clamp(value, lo, hi);
+            parent.Controls.Add(n);
+            return n;
         }
     }
 }

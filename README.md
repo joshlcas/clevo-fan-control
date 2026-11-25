@@ -87,8 +87,9 @@ the whole range down to 0 % is available. The EC table is still written and mode
 | Automatic | firmware owns the fans (mode 0), no software control |
 | Manual | one fixed duty per channel from the sliders (raw 0-255) |
 | Custom | the editable curve |
-| Quiet | Custom shifted 3 C later and trimmed 2 / 4 points, so it sits just under Custom |
+| Quiet | Custom shaped 3 C earlier (answers sooner) and trimmed a little, so it sits just under Custom everywhere |
 | Smart | Custom fed a predictive temperature, see below |
+| Locked | automatic, while the session is locked: power capped and fans idle. See below |
 
 ### Default Custom curve
 
@@ -129,6 +130,62 @@ Teff = T + clamp(trend, 0, 1.5 C/s) * 6 C + clamp((cpuBusy - 30%) / 70%, 0, 1) *
 
 Control runs every 2 s. UI polling runs every 1 s, and the fan count is cached so
 the second EC read is not repeated each tick.
+
+## Locked mode
+
+A separate feature from the modes above: when the session locks, the fans go
+quiet and the CPU is capped, so an idle machine stops moving air it does not
+need. Unlocking puts both back. It is on by default once the power plan exists
+(see below); untick "On lock: cap the power and let the fans idle" in the window,
+or "Quiet standby while locked" in the tray menu, to disable it. It never applies
+while you are working.
+
+A banner at the top of the window shows its state at a glance: red while locked
+mode is running, green when armed, amber if it is armed but the power plan is
+missing, and grey when disabled.
+
+Fan side (`FanCurve.Locked()`, fixed): 0 % up to 55 C, a gentle 14 % there and
+about 28 % at 60 C, full only near 90 C. The Safety guard still cuts in at its
+own threshold (92 C by default) whatever the mode. This curve is separate from
+Custom; "Edit curve..." does not touch it.
+
+The guard does not switch straight to full speed any more. Over the last 8 C
+below its threshold it ramps from whatever the curve asks up to full speed, so
+a curve never falls off a cliff at the threshold (Quiet used to go from 65 % to
+100 % in one step). The hard latch at the threshold remains as the safety net.
+
+The window scrolls: it opens as tall as the screen's working area allows, and
+everything below the header scrolls, so no setting is ever out of reach.
+
+Power side: a hidden plan named `ClevoFanControl - locked` with a clamped
+maximum processor state, no turbo boost, a high energy preference and some cores
+parked. The window's "Locked mode setup..." edits those numbers. The plan must be
+created once, by an admin:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\New-PowerPlan.ps1
+```
+
+Until that has been run, locking still quiets the fans, and the banner at the top
+turns amber (or says the CPU is not capped while locked) instead of claiming the
+CPU is capped. Without the plan nothing is throttled; nothing breaks.
+
+Notes:
+
+- `PROCTHROTTLEMAX` is a percentage of this CPU's own maximum clock. On the
+  i9-10900K (3.7 GHz base, ~4.9 GHz max) 25 % is about 0.9 GHz; 50 % is still
+  above base clock, so the default is 25.
+- Core parking is expressed as the percentage of cores left unparked, so
+  60 % on 10 cores leaves 6.
+- This machine has no package power limit (PL1/PL2) in its processor power
+  group, so there is deliberately no "watts" box; the clock caps are what
+  apply.
+- Restore is two-step: fans return first, then the previous power plan, so the
+  CPU never gets its clocks back while the fans are idle. If the app is killed
+  between the two, the next start sees `%APPDATA%\ClevoFanControl\locked-backup.ini`
+  and puts the old plan back.
+- Locked mode is never saved as the chosen mode; it is re-derived from the
+  session state, so a standby cannot survive a restart.
 
 ## Usage
 
