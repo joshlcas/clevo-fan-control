@@ -2,3 +2,7 @@
 *.exe
 *.pdb
 *.obj
+
+# Binary assets: never let git rewrite line endings in these (fancontrol.ico)
+*.ico binary
+*.png binary

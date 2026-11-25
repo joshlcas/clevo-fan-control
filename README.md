@@ -168,8 +168,20 @@ falls back to the defaults, so it can never leave the machine without a curve.
 ## Build
 
 ```
-csc /target:winexe /optimize+ /out:FanControl.exe ^
-    /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll FanControl.cs
+csc /target:winexe /optimize+ /win32icon:fancontrol.ico /out:FanControl.exe ^
+    /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll FanControl.cs
+```
+
+`fancontrol.ico` gives the exe its icon in Explorer, the taskbar and Alt-Tab. The
+window, the dialog and the tray icon draw the same mark in code (`Logo` in
+`FanControl.cs`), so nothing goes missing if the build forgets the `.ico`. To
+regenerate the `.ico` after changing the mark:
+
+```
+csc /target:exe /main:ClevoFan.IconTool /out:IconTool.exe ^
+    /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ^
+    tools\IconTool.cs FanControl.cs
+IconTool.exe fancontrol.ico
 ```
 
 `/target:winexe` matters. A console build allocates a console window before any

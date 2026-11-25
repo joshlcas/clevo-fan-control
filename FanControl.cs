@@ -1,5 +1,8 @@
+using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -38,6 +41,74 @@ namespace ClevoFan
         // and it never allocates, blocks or spins up a provider thread.
         [DllImport("kernel32", SetLastError = true)]
         public static extern bool GetSystemTimes(out FileTime idle, out FileTime kernel, out FileTime user);
+    }
+
+    // The app mark: four swept blades around a hub, in the accent blue, drawn in
+    // code so the build stays a single .cs file with no resource to lose.
+    static class Logo
+    {
+        public static readonly Color Accent = Color.FromArgb(0x1E, 0x6F, 0xD9);
+
+        public static Bitmap Render(int size)
+        {
+            Bitmap bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                Draw(g, size);
+            }
+            return bmp;
+        }
+
+        public static System.Drawing.Icon ToIcon(int size)
+        {
+            return System.Drawing.Icon.FromHandle(Render(size).GetHicon());
+        }
+
+        static void Draw(Graphics g, int size)
+        {
+            float s = size / 16f;
+
+            using (SolidBrush wash = new SolidBrush(Color.FromArgb(0xE9, 0xF1, 0xFC)))
+                g.FillEllipse(wash, 0.5f * s, 0.5f * s, 15f * s, 15f * s);
+            using (Pen ring = new Pen(Accent, Math.Max(1f, s)))
+                g.DrawEllipse(ring, 0.5f * s, 0.5f * s, 15f * s, 15f * s);
+
+            using (SolidBrush blade = new SolidBrush(Accent))
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    using (GraphicsPath p = Blade(s))
+                    using (Matrix m = new Matrix())
+                    {
+                        m.RotateAt(90f * i, new PointF(8f * s, 8f * s));
+                        p.Transform(m);
+                        g.FillPath(blade, p);
+                    }
+                }
+            }
+
+            using (SolidBrush hub = new SolidBrush(Accent))
+                g.FillEllipse(hub, 6.3f * s, 6.3f * s, 3.4f * s, 3.4f * s);
+            using (SolidBrush hole = new SolidBrush(Color.White))
+                g.FillEllipse(hole, 7.15f * s, 7.15f * s, 1.7f * s, 1.7f * s);
+        }
+
+        // One blade: a swept wedge from the hub, curved like a fan blade.
+        static GraphicsPath Blade(float s)
+        {
+            PointF[] pts = new PointF[]
+            {
+                new PointF(8.1f * s, 3.1f * s),
+                new PointF(10.9f * s, 5.6f * s),
+                new PointF(10.1f * s, 7.5f * s),
+                new PointF(8.1f * s, 6.6f * s),
+            };
+            GraphicsPath p = new GraphicsPath();
+            p.AddClosedCurve(pts, 0.4f);
+            return p;
+        }
     }
 
     // Same entry points the vendor FanSpeedSetting.exe uses.
@@ -898,7 +969,7 @@ namespace ClevoFan
             MinimizeBox = false;
             ShowInTaskbar = false;
             Font = new Font("Segoe UI", 9f);
-            Icon = SystemIcons.Application;
+            Icon = Logo.ToIcon(32);
 
             Label head = new Label();
             head.Text = "The EC pins the first point at 40 C / 25 % and will not let it be written, so the curve is applied in software from the minimum duty below.";
@@ -1113,7 +1184,7 @@ namespace ClevoFan
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             Font = new Font("Segoe UI", 9f);
-            Icon = SystemIcons.Application;
+            Icon = Logo.ToIcon(32);
 
             BuildUi();
             ApplySettingsToUi();
@@ -1167,18 +1238,25 @@ namespace ClevoFan
 
         void BuildUi()
         {
+            PictureBox mark = new PictureBox();
+            mark.Image = Logo.Render(32);
+            mark.SizeMode = PictureBoxSizeMode.AutoSize;
+            mark.Location = new Point(14, 8);
+            mark.BackColor = Color.Transparent;
+            Controls.Add(mark);
+
             Label title = new Label();
             title.Text = "Clevo Fan Control";
             title.Font = new Font("Segoe UI Semibold", 15f);
             title.AutoSize = true;
-            title.Location = new Point(14, 10);
+            title.Location = new Point(54, 10);
             Controls.Add(title);
 
             Label sub = new Label();
             sub.Text = "X170KM-G  -  drives the EC through the same AcpiBridge path as Control Center";
             sub.ForeColor = Color.DimGray;
             sub.AutoSize = true;
-            sub.Location = new Point(16, 42);
+            sub.Location = new Point(56, 42);
             Controls.Add(sub);
 
             GroupBox gStatus = MakeGroup("Live", 66, 98);
@@ -1439,7 +1517,7 @@ namespace ClevoFan
         void SetupTray()
         {
             tray = new NotifyIcon();
-            tray.Icon = SystemIcons.Application;
+            tray.Icon = Logo.ToIcon(16);
             tray.Text = "Clevo Fan Control";
             tray.Visible = true;
             tray.DoubleClick += delegate { ShowFromTray(); };
