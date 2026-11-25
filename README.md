@@ -59,51 +59,124 @@ Package 13 keeps returning the last written table regardless of mode, so treat
 ## Curves
 
 Four points per channel: `T1/D1 -> T2/D2 -> T3/D3 -> 100 C/100 %`, linear between
-them. `T1` and `D1` come from the EC and are not written by command 14.
+them. `T1` and `D1` come from the EC and can not be written by command 14.
 
-Original - the curve this machine shipped with:
+The machine shipped with:
 
 | Channel | T1/D1 | T2/D2 | T3/D3 |
 |---------|-------|-------|-------|
 | CPU | 40 C / 25 % | 65 C / 41 % | 80 C / 56 % |
 | GPU1 | 40 C / 25 % | 66 C / 48 % | 80 C / 59 % |
 
-Quiet - both mid points moved 3 C later and trimmed 2 / 4 points, so on paper it
-sits just under the original everywhere below 100 C:
+The EC does not track a written table closely: measured duty can sit well above
+or below what the table predicts at the same temperature, because the firmware
+smooths and second-guesses the points. In curve mode this machine would not go
+below about 38 %, and that is also roughly what the shipped table itself asks
+for once the cooling is not at 40 C (at 60 C it predicts 37.8 %).
 
-| Channel | T1/D1 | T2/D2 | T3/D3 |
-|---------|-------|-------|-------|
-| CPU | 40 C / 25 % | 68 C / 39 % | 83 C / 52 % |
-| GPU1 | 40 C / 25 % | 69 C / 46 % | 83 C / 55 % |
+The GUI therefore does not use the EC curve for control. It evaluates a curve in
+software and writes the result with command 104, which is exact. `T1` is used as
+the first temperature, but the duty at that point is the user's minimum duty, so
+the whole range down to 0 % is available. The EC table is still written and mode
+6 selected, purely as a fallback in case the process dies or the machine resumes.
 
-The table is written, the EC accepts it (`rc 14`) and selects mode 6, but this EC
-does not track the curve closely: measured duty can sit well above or below what
-the table predicts at the same temperature, because the firmware smooths and
-second-guesses the points. If you want a specific fan speed, set the duty
-directly - that path is exact.
+### Modes in the GUI
+
+| Mode | Behaviour |
+|------|-----------|
+| Automatic | firmware owns the fans (mode 0), no software control |
+| Manual | one fixed duty per channel from the sliders (raw 0-255) |
+| Custom | the editable curve |
+| Quiet | Custom shifted 3 C later and trimmed 2 / 4 points, so it sits just under Custom |
+| Smart | Custom fed a predictive temperature, see below |
+
+### Default Custom curve
+
+Deliberately quieter than both the firmware's automatic mode and the shipped
+table, which are aggressive on this machine (automatic sat at 65 % at 68 C
+during testing):
+
+| Point | Value |
+|-------|-------|
+| T1 / minimum duty | 40 C / 15 % |
+| T2 / D2 | 72 C / 28 % |
+| T3 / D3 | 86 C / 55 % |
+| 4th point | 100 C / 100 % |
+
+So it holds roughly 25-30 % through the low 70s and ramps hard above 85 C, with
+the temperature guard as the backstop. Raise D2 if you would rather trade noise
+for lower temperatures. "Edit curve..." shows a live preview at 45-85 C and can
+restore the shipped values.
+
+Minimum duty is the floor at and below T1. 0 % is allowed.
+
+### Smart mode
+
+The same curve, evaluated at a temperature slightly ahead of reality:
+
+```
+Teff = T + clamp(trend, 0, 1.5 C/s) * 6 C + clamp((cpuBusy - 30%) / 70%, 0, 1) * 4 C
+```
+
+- `trend` is the change over a 15 s window. A heat sink takes 10-30 s to show a
+  load, so the fan is normally told too late.
+- `cpuBusy` is system-wide CPU utilisation from `GetSystemTimes`, smoothed with a
+  short EMA. One kernel32 call per tick, no PDH counters, no WMI, no per-process
+  enumeration, no allocations. This is also why the load figure leads the
+  temperature: heat has to conduct to the sensor.
+- Duty moves at most +12 / -6 raw steps per 2 s, and only when the target moves
+  by 3 or more steps. That keeps it from hunting or whining.
+
+Control runs every 2 s. UI polling runs every 1 s, and the fan count is cached so
+the second EC read is not repeated each tick.
 
 ## Usage
 
-GUI: double-click `FanControl.exe` (or the Start Menu shortcut).
+GUI: double-click `FanControl.exe`. Closing the window keeps it running in the
+notification area; use **Exit** there to stop it. Right-clicking the tray icon
+also switches mode. "Start with Windows" writes an `HKCU` Run entry that starts it
+hidden with `--tray`.
 
 ```
-FanControl.exe --status              read fans once
-FanControl.exe --table               read the stored fan curve
-FanControl.exe --set 60              both fans to 60 %
-FanControl.exe --duty 153            both fans to raw duty 153 (0-255)
-FanControl.exe --cpu 60 --gpu 80     per-fan percent
-FanControl.exe --max                 full speed
-FanControl.exe --off                 duty 0
-FanControl.exe --auto                back to firmware control
-FanControl.exe --quiet               write the quiet curve and select it
-FanControl.exe --original            write back the curve this machine shipped with
-FanControl.exe --defaults            load the firmware default table (overwrites the curve)
-FanControl.exe --mode 0|1|6          firmware preset (auto / max / custom)
+FanControl.exe                     open the GUI
+FanControl.exe --tray              start hidden in the notification area
+FanControl.exe --status            read fans once
+FanControl.exe --table             read the stored fan curve
+FanControl.exe --set 60            both fans to 60 %
+FanControl.exe --duty 153          both fans to raw duty 153 (0-255)
+FanControl.exe --cpu 60 --gpu 80   per-fan percent
+FanControl.exe --max               full speed
+FanControl.exe --off               duty 0
+FanControl.exe --auto              back to firmware control
+FanControl.exe --custom            write the saved custom curve to the EC
+FanControl.exe --quiet             write the derived quiet curve to the EC
+FanControl.exe --defaults          load the firmware default table (overwrites the curve)
+FanControl.exe --mode 0|1|6        firmware preset (auto / max / custom)
 ```
+
+`--custom` and `--quiet` on the command line only write the EC table, so the EC
+interprets them loosely. The exact software curve is a GUI feature: the command
+line is one-shot and has no control loop.
 
 `--defaults` is the vendor "load default" call. It replaces the stored curve with
-the firmware default, which is not the same as this machine's shipped curve - use
-`--original` to get back to the curve in the table above.
+the firmware default, which is not the same as this machine's shipped curve.
+
+Settings (curve, minimum duty, mode, guard, autostart) live in
+`%APPDATA%\ClevoFanControl\settings.ini`. A missing or corrupt file silently
+falls back to the defaults, so it can never leave the machine without a curve.
+
+## Build
+
+```
+csc /target:winexe /optimize+ /out:FanControl.exe ^
+    /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll FanControl.cs
+```
+
+`/target:winexe` matters. A console build allocates a console window before any
+code runs, which is why older builds flashed a terminal next to the GUI (and, when
+launched from a shell, hid the caller's terminal). The exe now has no console of
+its own; the CLI path calls `AttachConsole(ATTACH_PARENT_PROCESS)` to borrow the
+calling shell's, and `AllocConsole` when launched from Explorer.
 
 ## Notes
 
@@ -113,7 +186,11 @@ the firmware default, which is not the same as this machine's shipped curve - us
   firmware may re-assert its curve after sleep/resume. Check the RPM readout.
 - If the app is killed while a manual duty is set, the EC keeps that duty until
   something calls `--auto` (or the machine is power-cycled). The GUI's
-  temperature guard only runs while the GUI is open.
+  temperature guard only runs while the GUI is open. Exiting through the GUI (or
+  a Windows shutdown) hands the fans back to automatic when "Hand fans back to
+  automatic" is ticked, which is the default.
+- The software curve fails safe: after three failed telemetry reads it hands the
+  fans back to automatic rather than leaving a low duty behind.
 - Control Center's own fan page will fight this tool if both are open. Close
   Control Center while using it.
 - Keep the "Acpi Bridge" device installed. Only the UWP app is replaceable; the
