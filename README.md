@@ -151,8 +151,10 @@ Custom; "Edit curve..." does not touch it.
 
 The guard does not switch straight to full speed any more. Over the last 8 C
 below its threshold it ramps from whatever the curve asks up to full speed, so
-a curve never falls off a cliff at the threshold (Quiet used to go from 65 % to
-100 % in one step). The hard latch at the threshold remains as the safety net.
+a curve never falls off a cliff at the threshold. Measured against real RPM
+from Quiet mode, the band now climbs smoothly: 1944 -> 2071 -> 2205 -> 2507 ->
+2890 -> 3343 -> 3783 -> 4195 RPM from 82 C to 92 C. The hard latch at the
+threshold remains as the safety net.
 
 The window scrolls: it opens as tall as the screen's working area allows, and
 everything below the header scrolls, so no setting is ever out of reach.
@@ -221,6 +223,36 @@ the firmware default, which is not the same as this machine's shipped curve.
 Settings (curve, minimum duty, mode, guard, autostart) live in
 `%APPDATA%\ClevoFanControl\settings.ini`. A missing or corrupt file silently
 falls back to the defaults, so it can never leave the machine without a curve.
+
+## Holding a duty against the EC
+
+The firmware does not leave a written duty alone: it reclaims the fans within
+about a second of each write and restores its own value. Measured on this
+machine, holding a fixed duty for 12 s and checking that the EC still reported
+it:
+
+| Re-send interval | Duty actually held |
+|------------------|--------------------|
+| 3 s (old default) | 4 % |
+| 2 s               | 65 % |
+| 1 s               | 83 % |
+| 0.5 s             | **88 %** |
+
+So the control loop re-sends the decided duty every 0.5 s rather than every
+3 s. That is the difference between the curve appearing to ignore temperature
+(every write was overwritten before the next one) and following it. The guard
+re-sends through the same path, so full speed is actually full speed:
+validated at 4200 RPM held for a full 20 s sample.
+
+Every write is also verified: the poll loop compares the EC's reported duty
+with what was commanded, and re-asserts if it drifted. A few seconds after any
+mode change are treated as normal settling rather than a failure, because the
+firmware ramps itself down over roughly that long.
+
+Note that the duty value is *not* inverted: duty 255 is full speed (about
+4200 RPM) and duty 0 is nearly stopped (about 400 RPM). The raw counter in
+package 12 moves the other way, which is why the README's `2156250 / counter`
+formula has a division in it - compare converted RPM, never the raw counter.
 
 ## Build
 

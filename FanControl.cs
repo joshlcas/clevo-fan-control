@@ -1500,7 +1500,11 @@ namespace ClevoFan
 
             poll.Interval = 1000;
             poll.Tick += delegate { Poll(); };
-            reapply.Interval = 3000;
+            // Measured on this EC: re-sending every 3 s held the requested duty
+            // only ~4% of the time (the firmware overwrites within ~1 s), 1 s
+            // held 83%, 500 ms held 88%. 500 ms is the point where it is
+            // reliably ours, without hammering the EC path every tick.
+            reapply.Interval = 500;
             reapply.Tick += delegate { Reapply(); };
 
             FormClosing += OnFormClosing;
@@ -1757,7 +1761,7 @@ namespace ClevoFan
             gSafety.Controls.Add(chkRestore);
 
             chkReapply = new CheckBox();
-            chkReapply.Text = "Keep re-applying the current duty (every 3 s)";
+            chkReapply.Text = "Keep re-applying the current duty (every 0.5 s)";
             chkReapply.AutoSize = true;
             chkReapply.Location = new Point(16, 78);
             gSafety.Controls.Add(chkReapply);
@@ -2316,6 +2320,7 @@ namespace ClevoFan
 
             // Apply the software target straight away rather than waiting a tick.
             if (lastT != null && lastT.Ok) ControlTick(lastT);
+            MarkSettling();
         }
 
         void ApplyManual()
@@ -2329,11 +2334,62 @@ namespace ClevoFan
             dutyNow[1] = gpu;
             dutyNow[2] = fanCount > 2 ? gpu : 0;
             lblStatus.Text = "manual duty " + cpu + "/" + gpu + "  (rc " + rc + ")";
+            MarkSettling();
+        }
+
+        // The EC accepts a duty write and then the firmware reclaims the fans
+        // within a second or two, so a write is only real if it is re-sent.
+        // These track whether the fans are actually doing what we asked.
+        int verifyMisses;
+        int settleUntilTick;
+        bool VerifyDuty(Telemetry t)
+        {
+            if (t == null || !t.Ok) return true;          // cannot judge
+            if (mode == FanMode.Auto) return true;        // firmware owns them
+            if (mode == FanMode.Manual && !chkReapply.Checked) return true;
+            if (dutyNow[0] < 0) return true;              // nothing commanded yet
+            if (tickCount < settleUntilTick) return true;  // firmware ramp-down is normal
+
+            // "Actually there" = within a few raw steps, allowing the EC's own
+            // rounding. The EC reports the *effective* duty, so a discarded
+            // write shows up as our value vanishing from the readback.
+            int wantCpu = dutyNow[0];
+            int wantGpu = dutyNow[1];
+            int tol = 4;   // EC rounds to raw steps; anything beyond this is a real miss
+            bool cpuOk = Math.Abs(t.CpuDuty - wantCpu) <= tol;
+            bool gpuOk = fanCount <= 1 || Math.Abs(t.GpuDuty - wantGpu) <= tol;
+
+            if (cpuOk && gpuOk)
+            {
+                verifyMisses = 0;
+                return true;
+            }
+            verifyMisses++;
+            return false;
+        }
+
+        // Re-send the duty we believe is correct. Called more often than the
+        // control tick, because the firmware reverts between ticks otherwise.
+        void AssertDuty()
+        {
+            if (dutyNow[0] < 0) return;
+            Fans.SetDuty(dutyNow[0], dutyNow[1], fanCount > 2 ? dutyNow[2] : 0);
         }
 
         void Reapply()
         {
-            if (guardActive) return;
+            // Automatic means firmware owns the fans: never write duty there.
+            if (mode == FanMode.Auto) return;
+
+            // The guard used to return here, which meant nothing was re-sent
+            // while it was active - so the EC dropped back to its own duty and
+            // the fans were never actually at full speed when the guard thought
+            // they were. Always hold whatever duty we last decided on.
+            if (guardActive)
+            {
+                AssertDuty();
+                return;
+            }
 
             if (mode == FanMode.Manual)
             {
@@ -2440,8 +2496,10 @@ namespace ClevoFan
                 Telemetry.ToRpm(t.CpuRpmRaw), t.CpuDuty, Fans.RawToPercent(t.CpuDuty), t.CpuTemp);
             lblGpu.Text = string.Format("GPU  {0,5} RPM   duty {1,3} ({2,3}%)   {3} C",
                 Telemetry.ToRpm(t.GpuRpmRaw), t.GpuDuty, Fans.RawToPercent(t.GpuDuty), t.GpuTemp);
-            lblInfo.Text = string.Format("fans detected: {0}   -   mode: {1}{2}",
-                fanCount, mode.ToString().ToLowerInvariant(), guardActive ? "   -   GUARD ACTIVE" : "");
+            lblInfo.Text = string.Format("fans detected: {0}   -   mode: {1}{2}{3}",
+                fanCount, mode.ToString().ToLowerInvariant(),
+                guardActive ? "   -   GUARD ACTIVE" : "",
+                verifyMisses > 1 && mode != FanMode.Auto ? "   -   re-asserting duty" : "");
 
             if (mode == FanMode.Auto)
                 lblSmart.Text = "firmware owns the fans (EC curve)";
@@ -2468,6 +2526,17 @@ namespace ClevoFan
 
             tickCount++;
             if (tickCount % 2 == 0) ControlTick(t);   // 2 s: thermal mass makes 1 s pointless
+
+            // The EC discards lone writes, so check that what we commanded is
+            // still what the fans are doing and re-assert hard if it vanished.
+            // Only complain once the grace period after a mode change is over,
+            // because the firmware ramps itself down for a few seconds there.
+            if (!VerifyDuty(t) && verifyMisses > 1)
+            {
+                AssertDuty();
+                if (guardActive)
+                    lblStatus.Text = "guard: duty was being overridden - re-asserted full speed";
+            }
         }
 
         void EnterModeSilent(FanMode m)
@@ -2488,6 +2557,17 @@ namespace ClevoFan
         // 1 at the threshold. The hard latch stays for failure safety (if the
         // fans are not moving at all by the threshold, they are forced on).
         const int GuardBand = 8;
+
+        // After any mode change the EC takes a few seconds to ramp to what was
+        // asked (it starts high, then settles). Treat that as normal rather
+        // than as the EC ignoring us.
+        const int SettleTicks = 5;
+
+        void MarkSettling()
+        {
+            settleUntilTick = tickCount + SettleTicks;
+            verifyMisses = 0;
+        }
 
         double GuardLift(int hottest)
         {
@@ -2515,6 +2595,8 @@ namespace ClevoFan
                 guardActive = true;
                 dutyNow[0] = dutyNow[1] = dutyNow[2] = 255;
                 Fans.SetDuty(255, 255, fanCount > 2 ? 255 : 0);
+                settleUntilTick = tickCount + SettleTicks;   // let the EC spin up
+                verifyMisses = 0;
                 lblStatus.Text = "guard: " + hottest + " C reached " + guard + " C - full speed";
             }
             else if (guardActive && hottest <= guard - 6)
