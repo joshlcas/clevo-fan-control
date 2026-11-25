@@ -167,6 +167,16 @@ falls back to the defaults, so it can never leave the machine without a curve.
 
 ## Build
 
+Close a running `FanControl.exe` first, or the compile fails with CS0016 (the
+exe is locked).
+
+```
+build.cmd
+```
+
+`build.cmd` runs the following from the repo root; it finds `csc.exe` in either
+the 64- or 32-bit .NET Framework folder:
+
 ```
 csc /target:winexe /optimize+ /win32icon:fancontrol.ico /out:FanControl.exe ^
     /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll FanControl.cs
