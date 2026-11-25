@@ -87,7 +87,7 @@ the whole range down to 0 % is available. The EC table is still written and mode
 | Automatic | firmware owns the fans (mode 0), no software control |
 | Manual | one fixed duty per channel from the sliders (raw 0-255) |
 | Custom | the editable curve |
-| Quiet | Custom shaped 3 C earlier (answers sooner) and trimmed a little, so it sits just under Custom everywhere |
+| Quiet | its own curve: 15 % at 40 C, 22 % at 62 C, 45 % at 74 C, full speed at 80 C (12 C below the guard) |
 | Smart | Custom fed a predictive temperature, see below |
 | Locked | automatic, while the session is locked: power capped and fans idle. See below |
 
@@ -110,6 +110,24 @@ for lower temperatures. "Edit curve..." shows a live preview at 45-85 C and can
 restore the shipped values.
 
 Minimum duty is the floor at and below T1. 0 % is allowed.
+
+### Quiet mode
+
+Quiet is not a shifted copy of Custom: it has its own four points, so it reaches
+full speed inside its own range instead of relying on the guard.
+
+| Point | Value |
+|-------|-------|
+| T1 / minimum duty | 40 C / 15 % |
+| T2 / D2 | 62 C / 22 % |
+| T3 / D3 | 74 C / 45 % |
+| 4th point | 80 C / 100 % |
+
+The top is 12 C below the guard threshold, so on the default 92 C setting full
+speed arrives at 80 C - before the guard band starts at 84 C. Measured on the
+machine: 760 RPM at 45 C, 1,406 at 65 C, 1,877 at 70 C, 3,080 at 75 C and 4,253
+at 80 C. The guard never takes over in normal running; it only catches a runaway
+that ignores the curve.
 
 ### Smart mode
 

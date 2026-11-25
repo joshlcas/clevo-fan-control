@@ -275,6 +275,50 @@ namespace ClevoFan
             MinDuty = Fans.Clamp(minDuty, 0, 50);
         }
 
+        // Where the curve reaches its final point (full speed). Custom uses the
+        // EC's own 100 C; Quiet brings it earlier so the curve tops out before
+        // the guard band would take over, instead of forever under it.
+        int fullC = 100;
+
+        public int FullC { get { return fullC; } }
+
+        // Returns a curve that reaches 100 % at `atC` smoothly.
+        //
+        // The upper part is redistributed inside the space that is left: T2 is
+        // kept, and T3 is placed so that the two remaining segments (T2->T3 and
+        // T3->full) split the span evenly and their duties climb without a
+        // cliff. Squeezing T3 right up against the top (or dropping it) put
+        // almost all the rise into a 1-4 C window, which is the same jump the
+        // guard band exists to avoid - it just moved it earlier.
+        public FanCurve WithTop(int atC)
+        {
+            int top = Fans.Clamp(atC, 25, 100);
+            FanCurve c = new FanCurve(T2, D2, T3, D3, MinDuty);
+            c.fullC = top;
+            for (int i = 0; i < 3; i++)
+            {
+                int t2 = c.T2[i];
+                if (t2 >= top - 2) continue;   // no room; leave this channel as is
+
+                // Split the remaining span in half: T3 sits midway, so both
+                // segments have real width.
+                int t3 = t2 + (Math.Max(2, top - t2) / 2);
+                if (t3 > top - 1) t3 = top - 1;
+
+                // Duty at T3 comes from the original shape, but capped so that
+                // the final half of the span still has room to climb to 100 %.
+                // That keeps the two segments comparable in steepness.
+                double orig = Eval(i, t3, 40);
+                double ceiling = 50.0 + 40.0 * (top == t2 ? 0 : (top - t3) / (double)(top - t2));
+                if (orig > ceiling) orig = ceiling;
+                if (orig < c.D2[i] + 3) orig = c.D2[i] + 3;   // never dip at T3
+
+                c.T3[i] = t3;
+                c.D3[i] = (int)Math.Round(Math.Min(orig, 90));
+            }
+            return c;
+        }
+
         // The machine's shipped curve, kept for "Reset to shipped" in the editor.
         public static FanCurve Shipped(int minDuty)
         {
@@ -289,7 +333,7 @@ namespace ClevoFan
             double x0 = t1, y0 = MinDuty;
             double x1 = T2[ch], y1 = D2[ch];
             double x2 = T3[ch], y2 = D3[ch];
-            const double x3 = 100.0, y3 = 100.0;
+            double x3 = fullC, y3 = 100.0;
 
             if (x1 <= x0) x1 = x0 + 1;
             if (x2 <= x1) x2 = x1 + 1;
@@ -695,34 +739,45 @@ namespace ClevoFan
             return new FanCurve(T2, D2, T3, D3, MinDuty);
         }
 
-        // Quiet = Custom evaluated 3 C earlier, i.e. the same shape moved so it
-        // answers a little sooner, then trimmed a couple of points.
+        // Quiet: its own curve, not a shifted copy of Custom.
         //
-        // The previous version shifted the anchor points instead, which broke
-        // the ramp: it kept Custom's T2->T3 slope only if T3 happened to move
-        // with T2, and the trim was taken out of the top too. The result was a
-        // curve that crawled (64 % at the guard) and then jumped straight to
-        // 100 % when the guard fired at 92 C. Shifting the temperature and
-        // trimming the output keeps the whole ramp smooth and, by construction,
-        // never louder than Custom at the same temperature.
-        public FanCurve QuietCurve()
+        // It used to be "Custom evaluated 3 C earlier", which tied its top end
+        // to Custom's. Custom only reaches 100 % at 100 C, but the guard starts
+        // ramping at (threshold - GuardBand) = 84 C on the default 92 setting, so
+        // the guard always took over first and Quiet never used its own range -
+        // it sat around 62 % when the guard fired. Moving Custom's anchors
+        // around to reach full earlier then squeezed the whole rise into a
+        // 1-4 C window, which just moved the cliff rather than removing it.
+        //
+        // So Quiet now has its own four points, chosen to sound calm and climb
+        // steadily:
+        //
+        //   T1 40 C / 15 %   no extra fan until the case is warm
+        //   T2 62 C / 22 %   still gentle well into the 60s
+        //   T3 74 C / 45 %   a real, audible climb through the 70s
+        //   full at `top`   100 %, reached before the guard band starts
+        //
+        // The top tracks the guard threshold, 12 C below it, so at the default
+        // 92 C full speed arrives at 80 C with 84 C (band start) still to spare.
+        // That means the guard never fires in normal running: its band only
+        // catches a runaway that ignores the curve.
+        public FanCurve QuietCurve(int guardTemp)
         {
-            // D2/T2/T3 are sampled from Custom 3 C to the left, so encode the
-            // shifted curve as anchor points that reproduce exactly that when
-            // interpolated: same temperatures, Custom's values from T-3.
-            FanCurve c = Custom();
+            int top = Math.Max(60, Math.Min(99, guardTemp - 12));
             int[] t2 = new int[3], d2 = new int[3], t3 = new int[3], d3 = new int[3];
             for (int i = 0; i < 3; i++)
             {
-                // Keep the temperatures; take the duty Custom would give 3 C earlier.
-                t2[i] = c.T2[i];
-                t3[i] = c.T3[i];
-                double atT2 = c.Eval(i, c.T2[i] - 3, 40);
-                double atT3 = c.Eval(i, c.T3[i] - 3, 40);
-                d2[i] = (int)Math.Round(atT2) - 2;
-                d3[i] = (int)Math.Round(atT3) - 4;
+                t2[i] = 62;
+                d2[i] = 22;
+                t3[i] = 74;
+                d3[i] = 45;
             }
-            return new FanCurve(t2, d2, t3, d3, Math.Max(0, MinDuty - 2));
+            return new FanCurve(t2, d2, t3, d3, Math.Max(0, MinDuty - 2)).WithTop(top);
+        }
+
+        public FanCurve QuietCurve()
+        {
+            return QuietCurve(92);   // matches the default guard threshold
         }
 
         static string Dir
@@ -2271,7 +2326,7 @@ namespace ClevoFan
                     break;
 
                 case FanMode.Quiet:
-                    ApplyCurveMode(settings.QuietCurve(), "quiet");
+                    ApplyCurveMode(settings.QuietCurve((int)numGuard.Value), "quiet");
                     break;
 
                 case FanMode.Smart:
@@ -2621,7 +2676,7 @@ namespace ClevoFan
 
             FanCurve c;
             if (mode == FanMode.Locked) c = FanCurve.Locked();
-            else if (mode == FanMode.Quiet) c = settings.QuietCurve();
+            else if (mode == FanMode.Quiet) c = settings.QuietCurve((int)numGuard.Value);
             else c = settings.Custom();
 
             double loadBoost = 0;
